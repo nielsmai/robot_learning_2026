@@ -107,13 +107,13 @@ class GRP(nn.Module):
         cfg.vocab_size = len(chars)
 
         # ===== CHOOSE MODE HERE =====
-        # Option A: Discrete mode (14 bins)
-        # self.action_representation = 'discrete'
-        # self.num_bins = 14
-        
-        # Option B: Continuous mode (uncomment to switch)
-        self.action_representation = 'continuous'
-        self.num_bins = None
+        # Read action representation from config (defaults to 'continuous' if missing)
+        self.action_representation = getattr(cfg, 'action_representation', 'continuous')
+        self.num_bins = 14 if self.action_representation == 'discrete' else None
+
+        # Print to check at runtime if the correct mode is selected
+        mode = "DISCRETE (14 bins)" if self.action_representation == 'discrete' else "CONTINUOUS"
+        print(f"[GRP] Action mode: {mode}")
         # ============================
 
         # TODO: 
