@@ -224,13 +224,28 @@ class GRP(nn.Module):
             
             attn_mask = torch.ones((batch_size, total_seq_len, total_seq_len), device=x.device)
             
-            # For evaluation, randomly mask one modality (50/50) to test robustness
-            if torch.rand(1).item() < 0.5 and lang_len > 0:
-                attn_mask[:, :, 1:1+lang_len] = 0  # Mask language
-            else:
+            # --- MODIFIED BLOCK START ---
+            # 1. Deterministic masking (fixing the freeze issue)
+            if mask_ == 'goal':
+                # Explicitly mask the GOAL IMAGE tokens so model follows Language
                 start = 1 + lang_len
                 end = start + goal_img_len
-                attn_mask[:, :, start:end] = 0  # Mask goal image
+                attn_mask[:, :, start:end] = 0 
+                
+            elif mask_ == 'lang':
+                # Explicitly mask the LANGUAGE tokens
+                attn_mask[:, :, 1:1+lang_len] = 0
+            
+            # 2. Random masking (legacy behavior for robustness testing)
+            else:
+                # 50/50 random drop if mask_ is just True
+                if torch.rand(1).item() < 0.5 and lang_len > 0:
+                    attn_mask[:, :, 1:1+lang_len] = 0  # Mask language
+                else:
+                    start = 1 + lang_len
+                    end = start + goal_img_len
+                    attn_mask[:, :, start:end] = 0  # Mask goal image
+            # --- MODIFIED BLOCK END ---
         # ====================================
 
         # Adding positional embedding

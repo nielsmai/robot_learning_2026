@@ -67,7 +67,7 @@ def eval_model_in_sim(cfg, model, device, log_dir, env, env_unwrapped,
             action, loss = model.forward(torch.tensor(obs_state.unsqueeze(0), dtype=torch.float32).to(device)
                                 ,torch.tensor(txt_goal).to(device)
                                 ,torch.tensor(goal_state.unsqueeze(0), dtype=torch.float32).to(device),
-                                mask_=True, ## Masks goal image
+                                mask_='goal', ## Masks goal image
                                 pose=torch.tensor([[obs["extra"]["tcp_pose"]]], dtype=torch.float32).to(device),
                                 )
 
