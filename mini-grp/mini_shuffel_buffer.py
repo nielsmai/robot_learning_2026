@@ -198,6 +198,8 @@ class CircularBuffer:
         if self._cfg.dataset.encode_with_t5:
             self._tokenizer = T5Tokenizer.from_pretrained(self._cfg.dataset.t5_version)
             self._text_model = T5ForConditionalGeneration.from_pretrained(self._cfg.dataset.t5_version)
+            self._text_model.to(self._cfg.device)
+            self._text_model.eval()
             # self._dataset_tmp["t5_language_embedding"] = torch.tensor(np.zeros(shape=(self._size, self._cfg.max_block_size, self._cfg.n_embd)), dtype=torch.float, device=self._cfg.device)[0],  
 
         self._builders = {}
@@ -228,12 +230,22 @@ class CircularBuffer:
             ## Only load first 200 samples for debugging
             dataset = datasets.load_dataset(self._cfg.dataset.to_name, split='train[:{}]'.format(self._cfg.dataset.buffer_size), keep_in_memory=True)
             print("Time to load huggingface dataset:", time.time() - start_)
+            # Check if T5 embeddings column exists BEFORE accessing it
+            has_t5_col = "t5_language_embedding" in dataset.column_names
+            print(f"Dataset columns: {dataset.column_names}")
+            print(f"T5 embeddings column exists: {has_t5_col}")
+
             dataset_tmp = {
-                "img": dataset["img"][:self._cfg.dataset.buffer_size], ## Some loading optimizations to improve debugging
+                "img": dataset["img"][:self._cfg.dataset.buffer_size],
                 "action": dataset["action"][:self._cfg.dataset.buffer_size],
                 "goal_img": dataset["goal_img"][:self._cfg.dataset.buffer_size],
                 "goal_text_full": dataset["goal_text_full"][:self._cfg.dataset.buffer_size],
-                "t5_language_embedding": dataset["t5_language_embedding"][:self._cfg.dataset.buffer_size] if self._cfg.dataset.encode_with_t5 else None,
+                # Only load embeddings if column exists; otherwise None → triggers on-the-fly encoding
+                "t5_language_embedding": (
+                    dataset["t5_language_embedding"][:self._cfg.dataset.buffer_size] 
+                    if has_t5_col and self._cfg.dataset.encode_with_t5 
+                    else None
+                ),
                 "pose": dataset["pose"][:self._cfg.dataset.buffer_size],
             }
             print("Time to load huggingface data and copy: ", time.time() - start__)
@@ -248,7 +260,12 @@ class CircularBuffer:
                         action,
                         dataset_tmp["goal_text_full"][i], 
                         dataset_tmp["goal_img"][i],
-                        language_instruction=dataset_tmp["t5_language_embedding"][i] if cfg.dataset.encode_with_t5 else None,
+                        # Only pass precomputed embedding if it exists; otherwise None triggers on-the-fly encoding
+                        language_instruction=(
+                            dataset_tmp["t5_language_embedding"][i] 
+                            if (cfg.dataset.encode_with_t5 and dataset_tmp["t5_language_embedding"] is not None) 
+                            else None
+                        ),
                         terminal=0,
                         pose=pose,
                         )
@@ -335,6 +352,31 @@ class CircularBuffer:
         if self._cfg.policy.use_image_augmentations:
             # TODO:
             ## Add image Augmentations to improve performance
+                        #Note: Apply the same augmentation across T dimension to maintain temporal consistency
+            #Named transform_crop_scale to be consistent with the else branch
+            transform_crop_scale = v2.Compose([
+                #Convert to float
+                v2.ToDtype(torch.float32, scale=True),
+                #Color variations
+                v2.ColorJitter(brightness = 0.2, contrast = 0.2, saturation=0.2, hue=0.1),
+                #Viewpoint variation
+                v2.RandomResizedCrop(
+                    size=(cfg.image_shape[0], cfg.image_shape[1]),
+                    scale=(0.9, 1.0), #Crop 90-100% of the image
+                    ratio=(0.9, 1.05), #Maintain aspect ratio
+                    interpolation=v2.InterpolationMode.BILINEAR
+                ),
+                #Simulate motion blur/defocus
+                v2.RandomApply([
+                    v2.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))
+                ], p=0.3),
+                #Simulate partial occlusions
+                v2.RandomErasing(p=0.25, scale=(0.02, 0.1), ratio=(0.3, 3.3)),
+                # Add sensor noise
+                v2.Lambda(lambda x: x + torch.randn_like(x) * 0.01),
+                # Convert to [-1, 1] range expected by model
+                v2.Lambda(lambda x: x * 2.0 - 1.0)
+            ])
         else:
             transform_crop_scale = v2.Compose([
                 v2.ToDtype(torch.float32) # Convert to float [0,1] after crop/resize
@@ -364,11 +406,19 @@ class CircularBuffer:
     
         # TODO: 
         ## Provide the block masking logic for the attention head
-        y = 0 ## discrete or continuous actions
-        if cfg.policy.action_stacking > 1:
-            ## Stack the next cfg.policy.action_stacking actions together
-            for i in range(1, cfg.policy.action_stacking): ## This is slow but works.
-                y = torch.cat((y, self._model.encode_action(data["action"][ix + i])), axis=1) ## stack on time timension.
+        # y = 0 ## discrete or continuous actions
+        # Encode actions appropriately
+        if cfg.get('action_representation', 'continuous') == 'discrete':
+            y = self._model.encode_action(data["action"][ix + cfg.policy.obs_stacking - 1])
+            if cfg.policy.action_stacking > 1:
+                for i in range(1, cfg.policy.action_stacking):
+                    next_actions = self._model.encode_action(data["action"][ix + i])
+                    y = torch.cat((y, next_actions), axis=1)
+        else:  # continuous
+            y = self._model.encode_action(data["action"][ix + cfg.policy.obs_stacking - 1])
+            if cfg.policy.action_stacking > 1:
+                for i in range(1, cfg.policy.action_stacking):
+                    y = torch.cat((y, self._model.encode_action(data["action"][ix + i])), axis=1)
         
         return x, pose, x_goal, x_goal_img, y
     

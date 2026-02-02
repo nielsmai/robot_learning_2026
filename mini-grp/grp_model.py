@@ -41,7 +41,14 @@ class Head(nn.Module):
         k = self.key(x)
         q = self.query(x)
         wei = q @ k.transpose(-2,-1) * C**-0.5
-        wei = wei.masked_fill(mask == 0, float('-inf'))
+        #Apply mask
+        if mask is not None:
+            # Ensure mask is broadcastable to (B, T, T)
+            if mask.dim() == 2:  # (T, T) -> (1, T, T)
+                mask = mask.unsqueeze(0)
+            # wei is (B, T, T), mask should be (B, T, T) or (1, T, T)
+            wei = wei.masked_fill(mask == 0, float('-inf'))
+
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
         v = self.value(x)
@@ -98,12 +105,62 @@ class GRP(nn.Module):
         self._cfg = cfg
         chars = cfg.dataset.chars_list
         cfg.vocab_size = len(chars)
+
+        # ===== CHOOSE MODE HERE =====
+        # Option A: Discrete mode (14 bins)
+        # self.action_representation = 'discrete'
+        # self.num_bins = 14
+        
+        # Option B: Continuous mode (uncomment to switch)
+        self.action_representation = 'continuous'
+        self.num_bins = None
+        # ============================
+
         # TODO: 
         ## Provide the logic for the GRP network
 
+        #1) Vision Embedding
+        patch_dim = (cfg.patch_size**2) * 3  # = 8*8*3 = 192
+        self.patch_embedding = nn.Linear(patch_dim, cfg.n_embd)
+
+        #Goal image projection
+        self.goal_patch_embedding = nn.Linear((cfg.patch_size**2) * 3, cfg.n_embd)
+
+        #Text/Goal embedding
+        if not cfg.dataset.encode_with_t5:
+            self.token_embedding_table = nn.Embedding(len(cfg.dataset.chars_list), cfg.n_embd)
+        
+        # 3) Learned Tokens
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
+
         # 4) Transformer encoder blocks
+        self.blocks = nn.ModuleList([
+            Block(cfg.n_embd, n_head=cfg.n_head, dropout=cfg.dropout) 
+            for _ in range(cfg.n_blocks)
+        ])
+        self.ln_f = nn.LayerNorm(cfg.n_embd)
 
         # 5) Classification MLPk
+        # Action head - different output sizes for discrete vs continuous
+        if self.action_representation == 'discrete':
+            print("DISCRETE MODE (14 bins) - Cross-Entropy Loss")
+            # Output logits for each bin per action dimension per timestep
+            self.action_head = nn.Sequential(
+                nn.Linear(cfg.n_embd, cfg.n_embd * mlp_ratio),
+                nn.ReLU(),
+                nn.Linear(cfg.n_embd * mlp_ratio, 
+                        cfg.action_dim * cfg.policy.action_stacking * self.num_bins)
+            )
+        else:  # continuous
+            print("CONTINUOUS MODE - MSE Loss")
+            self.action_head = nn.Sequential(
+                nn.Linear(cfg.n_embd, cfg.n_embd * mlp_ratio),
+                nn.ReLU(),
+                nn.Linear(cfg.n_embd * mlp_ratio, 
+                        cfg.action_dim * cfg.policy.action_stacking)
+            )
+        
+        self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -129,19 +186,85 @@ class GRP(nn.Module):
         ## Provide the logic to produce the output and loss for the GRP
         
         # Map the vector corresponding to each patch to the hidden size dimension
+        obs_embeddings = self.patch_embedding(obs_patches)
+        goal_img_embeddings = self.goal_patch_embedding(patches_g)
 
         # Adding classification and goal_img tokens to the tokens
+        batch_size = images.shape[0]
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+
+        x = torch.cat((cls_tokens, goals_e, goal_img_embeddings, obs_embeddings), dim=1)
+        
+        # ===== BLOCK MASKING =====
+        #50/50 random dropout
+        attn_mask = None
+        
+        # During TRAINING: create block mask to randomly mask language OR goal image
+        if self.training and targets is not None:
+            lang_len = goals_e.shape[1]
+            goal_img_len = goal_img_embeddings.shape[1]
+            total_seq_len = x.shape[1]
+            
+            # Create 3D attention mask (B, T, T) where 0 = block, 1 = allow
+            attn_mask = torch.ones((batch_size, total_seq_len, total_seq_len), device=x.device)
+            
+            # Apply same mask to entire batch (50/50 for language vs goal image)
+            if torch.rand(1).item() < 0.5:  # Mask language tokens
+                attn_mask[:, :, 1:1+lang_len] = 0  # Block attention TO language tokens
+            else:  # Mask goal image tokens
+                start = 1 + lang_len
+                end = start + goal_img_len
+                attn_mask[:, :, start:end] = 0  # Block attention TO goal image tokens
+        
+        # During EVALUATION: use mask_ parameter if provided
+        elif mask_:
+            lang_len = goals_e.shape[1]
+            goal_img_len = goal_img_embeddings.shape[1]
+            total_seq_len = x.shape[1]
+            
+            attn_mask = torch.ones((batch_size, total_seq_len, total_seq_len), device=x.device)
+            
+            # For evaluation, randomly mask one modality (50/50) to test robustness
+            if torch.rand(1).item() < 0.5 and lang_len > 0:
+                attn_mask[:, :, 1:1+lang_len] = 0  # Mask language
+            else:
+                start = 1 + lang_len
+                end = start + goal_img_len
+                attn_mask[:, :, start:end] = 0  # Mask goal image
+        # ====================================
 
         # Adding positional embedding
+        pos_emb = calc_positional_embeddings(x.shape[1], self._cfg.n_embd).to(x.device)
+        x = x + pos_emb
 
-        # Compute blocked masks
-
-        # Transformer Blocks
+        # Transformer Blocks with mask
+        for block in self.blocks:
+            x = block(x, mask=attn_mask)
+        x = self.ln_f(x)
 
         # Getting the classification token only
+        cls_output = x[:, 0, :]
 
         # Compute output and loss
+        out = self.action_head(cls_output)
+
+        loss = None
+        if targets is not None:
+            if self.action_representation == 'discrete':
+                # Reshape for cross-entropy: [B, T*action_dim, num_bins]
+                B = out.shape[0]
+                logits = out.view(B, self._cfg.policy.action_stacking, 
+                                self._cfg.action_dim, self.num_bins)
+                logits = logits.view(B * self._cfg.policy.action_stacking * self._cfg.action_dim, self.num_bins)
+                
+                # Targets should be bin indices [B * T * action_dim]
+                targets_flat = targets.view(-1).long()
+                loss = F.cross_entropy(logits, targets_flat)
+            else:  # continuous
+                loss = F.mse_loss(out, targets)
+        
         return (out, loss)
+
     
     def resize_image(self, image):
         """
@@ -188,7 +311,38 @@ class GRP(nn.Module):
                 raise ValueError("tokenizer and text_model must be provided when using T5 encoding")
             # TODO:    
             ## Provide the logic converting text goal to T5 embedding tensor
-            pass
+            # Handle both single string and batch inputs
+            # Handle precomputed embeddings (from buffer) vs raw text
+            if isinstance(goal, torch.Tensor):  # Already embedded (from buffer)
+                return goal.unsqueeze(0) if goal.dim() == 2 else goal  # Ensure [B, T, E]
+            
+            # Raw text input - encode on-the-fly (for eval/inference)
+            inputs = tokenizer(
+                goal,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=self._cfg.max_block_size
+            ).to(text_model.device)
+            
+            with torch.no_grad():
+                outputs = text_model(**inputs)
+                embeddings = outputs.last_hidden_state
+            
+            # Ensure exact shape
+            if embeddings.shape[1] < self._cfg.max_block_size:
+                pad = torch.zeros(
+                    embeddings.shape[0],
+                    self._cfg.max_block_size - embeddings.shape[1],
+                    embeddings.shape[2],
+                    device=embeddings.device
+                )
+                embeddings = torch.cat([embeddings, pad], dim=1)
+            elif embeddings.shape[1] > self._cfg.max_block_size:
+                embeddings = embeddings[:, :self._cfg.max_block_size]
+            
+            return embeddings  # Shape: [1, max_block_size, hidden_size]
+                 
         else:
             pad = " " * self._cfg.max_block_size
             goal_ = goal[:self._cfg.max_block_size] + pad[len(goal):self._cfg.max_block_size]
@@ -208,11 +362,37 @@ class GRP(nn.Module):
         if tokenizer is None or text_model is None:
             raise ValueError("tokenizer and text_model must be provided when using T5 encoding")
         
-        goal_ = _np.zeros((self._cfg.max_block_size, self._cfg.n_embd), dtype=_np.float32)
-        input_ids = tokenizer(goal, return_tensors="pt").input_ids
-        goal_t = text_model.encoder(input_ids).last_hidden_state.detach().cpu().numpy()
-        goal_[:len(goal_t[0]), :] = goal_t[0][:self._cfg.max_block_size]
-        return goal_
+        # Tokenize with proper padding/truncation
+        inputs = tokenizer(
+            goal,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self._cfg.max_block_size
+        ).to(text_model.device)
+        
+        # Get embeddings (disable gradients)
+        with torch.no_grad():
+            encoder_outputs = text_model.encoder(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"]
+            )
+            embeddings = encoder_outputs.last_hidden_state[:, 0, :]  # [CLS] token or first token
+        
+        # Convert to numpy and ensure exact shape
+        embeddings_np = embeddings.cpu().numpy()
+        
+        # Pad/truncate to exact max_block_size
+        if embeddings_np.shape[0] < self._cfg.max_block_size:
+            pad = np.zeros(
+                (self._cfg.max_block_size - embeddings_np.shape[0], embeddings_np.shape[1]),
+                dtype=np.float32
+            )
+            embeddings_np = np.concatenate([embeddings_np, pad], axis=0)
+        elif embeddings_np.shape[0] > self._cfg.max_block_size:
+            embeddings_np = embeddings_np[:self._cfg.max_block_size]
+        
+        return embeddings_np  # Shape: [max_block_size, hidden_size]
 
     def decode_action(self, action_tensor):
         
@@ -241,7 +421,69 @@ class GRP(nn.Module):
         action_mean = _torch.tensor(self._cfg.env.action_mean, dtype=action_float.dtype, device=action_float.device)
         action_std = _torch.tensor(self._cfg.env.action_std, dtype=action_float.dtype, device=action_float.device)
         return (action_float - action_mean) / action_std
+    
+    def _continuous_to_bins(self, actions):
+        """Convert continuous actions [-1, 1] to bin indices [0, num_bins-1]"""
+        # Clip to [-1, 1] range first
+        actions = torch.clamp(actions, -1.0, 1.0)
+        # Map to [0, num_bins-1]
+        bin_indices = ((actions + 1.0) / 2.0 * self.num_bins).long()
+        bin_indices = torch.clamp(bin_indices, 0, self.num_bins - 1)
+        return bin_indices
 
+    def _bins_to_continuous(self, bin_indices):
+        """Convert bin indices to continuous values (bin centers)"""
+        # Map bin index to center of bin in [-1, 1] range
+        bin_centers = (bin_indices.float() + 0.5) / self.num_bins * 2.0 - 1.0
+        return bin_centers
+
+    def encode_action(self, action_float):
+        """Encode continuous action to either normalized value or bin index"""
+        import torch as _torch
+        action_mean = _torch.tensor(self._cfg.dataset.action_mean, 
+                                dtype=action_float.dtype, 
+                                device=action_float.device)
+        action_std = _torch.tensor(self._cfg.dataset.action_std, 
+                                dtype=action_float.dtype, 
+                                device=action_float.device)
+        
+        # First normalize to [-1, 1]
+        normalized = (action_float - action_mean) / action_std
+        
+        if self.action_representation == 'discrete':
+            return self._continuous_to_bins(normalized)
+        else:
+            return normalized
+
+    def decode_action(self, action_tensor):
+        """Decode action from model output to environment-ready values"""
+        import torch as _torch
+        
+        if self.action_representation == 'discrete':
+            # Reshape to [action_stacking, action_dim, num_bins]
+            B = action_tensor.shape[0]
+            logits = action_tensor.view(B, self._cfg.policy.action_stacking,
+                                    self._cfg.action_dim, self.num_bins)
+            # Get most probable bin per dimension
+            bin_indices = torch.argmax(logits, dim=-1)  # [B, T, action_dim]
+            # Convert to continuous values
+            continuous = self._bins_to_continuous(bin_indices.float())
+            # Flatten to [B, T*action_dim]
+            continuous = continuous.view(B, -1)
+            action_tensor = continuous
+        
+        # Denormalize to original action space
+        action_mean = _torch.tensor(
+            np.repeat(self._cfg.dataset.action_mean, self._cfg.policy.action_stacking),
+            dtype=action_tensor.dtype, 
+            device=action_tensor.device
+        )
+        action_std = _torch.tensor(
+            np.repeat(self._cfg.dataset.action_std, self._cfg.policy.action_stacking),
+            dtype=action_tensor.dtype, 
+            device=action_tensor.device
+        )
+        return (action_tensor * action_std) + action_mean
 
 @torch.no_grad()
 def estimate_loss(model, dataset):

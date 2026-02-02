@@ -63,7 +63,13 @@ def my_main(cfg: DictConfig):
     if cfg.dataset.encode_with_t5: ## Load T5 model
         # TODO:    
         ## Load the T5 model and tokenizer
-        pass
+        from transformers import T5Tokenizer, T5EncoderModel
+
+        tokenizer = T5Tokenizer.from_pretrained(cfg.dataset.t5_version)
+        text_model = T5EncoderModel.from_pretrained(cfg.dataset.t5_version)
+        text_model.to(cfg.device)
+        text_model.eval() #Useful for inference speed?
+        print(f"Loaded T5 model: {cfg.dataset.t5_version}")
 
     from mini_shuffel_buffer import CircularBuffer, get_dataset_portion
 
