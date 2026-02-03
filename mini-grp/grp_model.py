@@ -405,9 +405,15 @@ class GRP(nn.Module):
         """
         import torch as _torch
         ## The action tensor is of shape (batch_size, action_dim * action_stacking) so we need to repeat the mean and std per action stacking
-        action_mean = _torch.tensor(np.repeat(self._cfg.env.action_mean, self._cfg.policy.action_stacking), dtype=action_tensor.dtype, device=action_tensor.device)
-        action_std = _torch.tensor(np.repeat(self._cfg.env.action_std, self._cfg.policy.action_stacking), dtype=action_tensor.dtype, device=action_tensor.device)
-        return (action_tensor * action_std) + action_mean
+        action_mean = _torch.tensor(np.repeat(self._cfg.dataset.action_mean, self._cfg.policy.action_stacking), dtype=action_tensor.dtype, device=action_tensor.device)
+        action_std = _torch.tensor(np.repeat(self._cfg.dataset.action_std, self._cfg.policy.action_stacking), dtype=action_tensor.dtype, device=action_tensor.device)    
+            # Denormalize
+        action = (action_tensor * action_std) + action_mean
+        
+        action_scaling = getattr(self._cfg.env, 'action_scaling', 1.0)
+        action = action * action_scaling
+        
+        return action
     
     def encode_action(self, action_float):
         """
@@ -418,8 +424,8 @@ class GRP(nn.Module):
         self._encode_action = lambda af:   (af - action_mean)/(action_std) # encoder: take a float, output an integer
         """
         import torch as _torch
-        action_mean = _torch.tensor(self._cfg.env.action_mean, dtype=action_float.dtype, device=action_float.device)
-        action_std = _torch.tensor(self._cfg.env.action_std, dtype=action_float.dtype, device=action_float.device)
+        action_mean = _torch.tensor(self._cfg.dataset.action_mean, dtype=action_float.dtype, device=action_float.device)
+        action_std = _torch.tensor(self._cfg.dataset.action_std, dtype=action_float.dtype, device=action_float.device)
         return (action_float - action_mean) / action_std
     
     def _continuous_to_bins(self, actions):
@@ -436,54 +442,6 @@ class GRP(nn.Module):
         # Map bin index to center of bin in [-1, 1] range
         bin_centers = (bin_indices.float() + 0.5) / self.num_bins * 2.0 - 1.0
         return bin_centers
-
-    def encode_action(self, action_float):
-        """Encode continuous action to either normalized value or bin index"""
-        import torch as _torch
-        action_mean = _torch.tensor(self._cfg.dataset.action_mean, 
-                                dtype=action_float.dtype, 
-                                device=action_float.device)
-        action_std = _torch.tensor(self._cfg.dataset.action_std, 
-                                dtype=action_float.dtype, 
-                                device=action_float.device)
-        
-        # First normalize to [-1, 1]
-        normalized = (action_float - action_mean) / action_std
-        
-        if self.action_representation == 'discrete':
-            return self._continuous_to_bins(normalized)
-        else:
-            return normalized
-
-    def decode_action(self, action_tensor):
-        """Decode action from model output to environment-ready values"""
-        import torch as _torch
-        
-        if self.action_representation == 'discrete':
-            # Reshape to [action_stacking, action_dim, num_bins]
-            B = action_tensor.shape[0]
-            logits = action_tensor.view(B, self._cfg.policy.action_stacking,
-                                    self._cfg.action_dim, self.num_bins)
-            # Get most probable bin per dimension
-            bin_indices = torch.argmax(logits, dim=-1)  # [B, T, action_dim]
-            # Convert to continuous values
-            continuous = self._bins_to_continuous(bin_indices.float())
-            # Flatten to [B, T*action_dim]
-            continuous = continuous.view(B, -1)
-            action_tensor = continuous
-        
-        # Denormalize to original action space
-        action_mean = _torch.tensor(
-            np.repeat(self._cfg.dataset.action_mean, self._cfg.policy.action_stacking),
-            dtype=action_tensor.dtype, 
-            device=action_tensor.device
-        )
-        action_std = _torch.tensor(
-            np.repeat(self._cfg.dataset.action_std, self._cfg.policy.action_stacking),
-            dtype=action_tensor.dtype, 
-            device=action_tensor.device
-        )
-        return (action_tensor * action_std) + action_mean
 
 @torch.no_grad()
 def estimate_loss(model, dataset):
